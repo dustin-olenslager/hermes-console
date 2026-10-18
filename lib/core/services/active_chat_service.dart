@@ -92,6 +92,7 @@ import 'generated_image_service.dart';
 import 'generated_media_service.dart';
 import 'global_activity_aggregate.dart';
 import 'local_transcript_store.dart';
+import 'transcript_cursor_store.dart';
 import 'interactive_prompt_reducer.dart';
 import 'profile_chat_mode.dart';
 import 'recovery_proof.dart';
@@ -10477,6 +10478,78 @@ class ActiveChat {
       localProjection: _localProjectionToken,
       recordedAtMs: _wallClockMs(),
     );
+    // Punto único que sabe que este dispositivo ya publicó una proyección
+    // contigua hasta una fila durable: se persiste para que la próxima apertura
+    // o reconexión pida el delta (`after_row_id`) en vez de la ventana entera.
+    final newestRowId = page.messages.isEmpty
+        ? null
+        : SessionMessagesDelta.rowIdOf(page.messages.last);
+    if (newestRowId != null) {
+      unawaited(
+        TranscriptCursorStore.write(
+          connection.id,
+          context.requestedStoredSessionId,
+          profile: context.profile,
+          cursor: TranscriptCursor(
+            rowId: newestRowId,
+            tipRowId: newestRowId,
+            messageCount: page.messages.length,
+            updatedAtMs: _wallClockMs(),
+          ),
+        ),
+      );
+    }
+  }
+
+  /// Ventana acotada usada como evidencia de entrega de turnos encolados.
+  ///
+  /// Antes esto leía el transcript ENTERO (`getMessages`, 500 filas por
+  /// petición): en una sesión de 25k mensajes eran ~360 MB cada 5 s, y aun así
+  /// solo podía demostrar entrega, nunca ausencia — que es lo que de verdad
+  /// desatasca una fila cuyo submit no cruzó el socket. La evidencia exacta que
+  /// falta la aporta `turn.status` en `_resolveAmbiguousQueuedTurns`.
+  Future<List<Map<String, dynamic>>> _readSettlementWindow(
+    String profile,
+  ) async {
+    final storedSessionId = serverSessionId;
+    final rows = <int, Map<String, dynamic>>{};
+    void absorb(List<Map<String, dynamic>> page) {
+      for (var index = 0; index < page.length; index++) {
+        final row = page[index];
+        final rowId = SessionMessagesDelta.rowIdOf(row);
+        rows[rowId ?? -(index + 1)] = row;
+      }
+    }
+
+    final cursor = await TranscriptCursorStore.read(
+      connection.id,
+      storedSessionId,
+      profile: profile,
+    );
+    if (cursor != null) {
+      try {
+        final delta = await _api.getMessagesAfter(
+          storedSessionId,
+          profile: profile,
+          afterRowId: cursor.rowId,
+          limit: 120,
+          includeReasoning: false,
+        );
+        if (delta.supported) absorb(delta.messages);
+      } on Object {
+        // La ventana de cola de abajo sigue siendo suficiente.
+      }
+    }
+    final tail = await _api.getMessagesPage(
+      storedSessionId,
+      profile: profile,
+      limit: 120,
+      offset: 0,
+      includeReasoning: false,
+    );
+    absorb(tail.messages);
+    final ordered = rows.keys.toList()..sort();
+    return [for (final key in ordered) rows[key]!];
   }
 
   Future<void> loadMessages({
@@ -20704,6 +20777,10 @@ class ActiveChat {
       // el usuario cancele, llegue un terminal o se destruya el chat.
       final epochInvalidated = _turnEpochInvalidated.future;
       var attempt = 0;
+      // Consecutive `turn.status` answers that do not contain this turn. See
+      // the `!status.known` branch below: absence is terminal, so it needs an
+      // exit condition instead of an endless reconnect loop.
+      var absentObservations = 0;
       Object lastError = originalError;
       while (_canRecoverTurn(turnEpoch)) {
         final delay = _atLeastGatewayBackoff(
@@ -20757,7 +20834,33 @@ class ActiveChat {
               ? status.state?.name ?? 'unknown'
               : 'unknown';
           debugPrint('[active-chat] result kind=$resultKind');
-          if (!status.known || status.state == null) continue;
+          if (!status.known || status.state == null) {
+            // The registry answered and does not contain this turn. Waiting
+            // cannot change that: nothing ever reached the server, so this is
+            // proof of absence, not ambiguity. Two consecutive answers are
+            // required so a submit still being persisted is never read as a
+            // lost one. Retrying here is the whole fix for "queued forever":
+            // the row goes back to `failedBeforeAcceptance` and the queue
+            // resubmits it with the same client_turn_id, which the server
+            // dedupes if it did land after all.
+            absentObservations += 1;
+            if (absentObservations < 2) continue;
+            await delivery.markRejectedBeforeAcceptance();
+            if (!_canRecoverTurn(turnEpoch)) return;
+            // The app is bilingual and this service has no BuildContext, so
+            // the sentence follows the same inline EN/ES idiom as
+            // activeChatPromptFailureUiMessage above.
+            _failRun(
+              PlatformDispatcher.instance.locale.languageCode == 'es'
+                  ? 'Hermes no recibió este mensaje. No se envió y la cola lo '
+                        'está reintentando.'
+                  : 'Hermes never received this message. It was not sent, and '
+                        'the queue is retrying it.',
+              failureMetadata: const {'delivery': 'not_sent'},
+            );
+            return;
+          }
+          absentObservations = 0;
           switch (status.state!) {
             case DesktopTurnState.accepted:
               if (!_commitDesktopRecoverySnapshot(gateway, binding)) continue;
@@ -24742,6 +24845,9 @@ class ActiveChat {
   }
 
   bool _queuedDeliverySettleInFlight = false;
+  /// Serializes `_resolveAmbiguousQueuedTurns`: two reconnects must not ask the
+  /// same `turn.status` and mark the same row unaccepted twice.
+  bool _queuedAmbiguityInFlight = false;
   int _lastQueuedDeliverySettleMs = 0;
 
   /// Evidencia `unknown` ya calculada: (clientTurnId → nº de filas del
@@ -24845,7 +24951,7 @@ class ActiveChat {
       final profile = _storedSessionProfile;
       final List<Map<String, dynamic>> chronological;
       try {
-        chronological = await _loadStoredMessages(profile);
+        chronological = await _readSettlementWindow(profile);
       } catch (_) {
         return;
       }
@@ -25860,17 +25966,28 @@ class ActiveChat {
       _preparedTurnDrainInFlight = true;
       _queueDrainInFlightId = 'prepared:${turn.clientTurnId}';
       try {
-        final accepted = await send(
-          fullText: turn.fullText,
-          desktopText: turn.desktopText,
-          model: turn.model,
-          history: _buildHistoryFromMessages(),
-          profile: turn.profile,
-          nativeAttachments: turn.activeAttachments,
-          queued: true,
-          delivery: next.delivery,
-          allowTransportFallbackOverride: next.allowTransportFallback,
-        );
+        final bool accepted;
+        try {
+          accepted = await send(
+            fullText: turn.fullText,
+            desktopText: turn.desktopText,
+            model: turn.model,
+            history: _buildHistoryFromMessages(),
+            profile: turn.profile,
+            nativeAttachments: turn.activeAttachments,
+            queued: true,
+            delivery: next.delivery,
+            allowTransportFallbackOverride: next.allowTransportFallback,
+          );
+        } catch (_) {
+          // Un throw aquí escapaba de un `unawaited(_drainQueue())`: la cabeza
+          // seguía primera, sin temporizador armado y sin nadie que volviera a
+          // preguntar. Se trata como rechazo y el reintento acotado se encarga.
+          _blockedPreparedTurnId = turn.clientTurnId;
+          _emit(ActiveChatEvent.queueChanged);
+          _scheduleQueuedRetry(turn.clientTurnId);
+          return;
+        }
         if (accepted &&
             _preparedTurnQueue.isNotEmpty &&
             identical(_preparedTurnQueue.first, next)) {
@@ -25904,7 +26021,7 @@ class ActiveChat {
     // pasivo) podían leer la misma cabeza y enviarla dos veces.
     _preparedTurnDrainInFlight = true;
     _queueDrainInFlightId = next.id;
-    final bool accepted;
+    var accepted = false;
     try {
       accepted = await send(
         mentionsFrozen: true,
@@ -25916,6 +26033,11 @@ class ActiveChat {
         queued: true,
         allowTransportFallbackOverride: next.allowTransportFallback,
       );
+    } catch (_) {
+      // A throw here used to escape the `unawaited` drain with the head still
+      // first and nothing armed to ask again: the entry sat "queued" forever.
+      // A throw is a rejection, and the bounded retry below owns it.
+      accepted = false;
     } finally {
       _preparedTurnDrainInFlight = false;
       _queueDrainInFlightId = null;
@@ -26050,20 +26172,136 @@ class ActiveChat {
     final head = _preparedTurnQueue.isEmpty
         ? null
         : _preparedTurnQueue.first.turn;
-    // A prepared head blocked only by its failed send is retryable again;
-    // one blocked because its delivery started stays blocked.
+    // A prepared head blocked only by its failed send is retryable again; one
+    // blocked because its delivery started stays blocked until the server's own
+    // turn registry says whether it exists — see
+    // `_resolveAmbiguousQueuedTurns`, which this reconnect now triggers.
     if (head != null &&
         _blockedPreparedTurnId == head.clientTurnId &&
-        head.queueOrder != null &&
-        head.state != PreparedTurnState.submitting &&
-        head.state != PreparedTurnState.ambiguous &&
-        head.state != PreparedTurnState.accepted &&
-        head.state != PreparedTurnState.running &&
-        !_hasMissingAttachment(head)) {
+        _isRetryableAfterTransportRestore(head)) {
       _blockedPreparedTurnId = null;
     }
     if (hadRetryState) _emit(ActiveChatEvent.queueChanged);
     if (!_queueDrainSuspended && !isStreaming) Timer.run(_drainQueue);
+    unawaited(_resolveAmbiguousQueuedTurns());
+  }
+
+  /// Whether a head that was blocked by a transport failure may be sent again
+  /// now that the transport is back.
+  ///
+  /// `accepted`/`running` belong to the server and `submitting` is still in
+  /// flight. `ambiguous` (transport started, no acknowledgement) is retryable
+  /// only when the server can dedupe the resubmission AND the local view can
+  /// attribute the row: the same `client_turn_id` plus a known retry boundary
+  /// is what keeps "delivery unknown" from double-sending.
+  bool _isRetryableAfterTransportRestore(PreparedTurn turn) {
+    if (turn.queueOrder == null || _hasMissingAttachment(turn)) return false;
+    switch (turn.state) {
+      case PreparedTurnState.submitting:
+      case PreparedTurnState.accepted:
+      case PreparedTurnState.running:
+        return false;
+      case PreparedTurnState.ambiguous:
+        final kind = turn.retryBoundary?.kind;
+        return kind == PreparedTurnRetryBoundaryKind.identity ||
+            kind == PreparedTurnRetryBoundaryKind.empty ||
+            kind == PreparedTurnRetryBoundaryKind.knownMissing;
+      case PreparedTurnState.prepared:
+      case PreparedTurnState.failedBeforeAcceptance:
+      case PreparedTurnState.terminal:
+        return true;
+    }
+  }
+
+  /// Resolves queued rows whose transport started but was never acknowledged
+  /// ("delivery unknown") against the server's own turn registry.
+  ///
+  /// This is the missing half of the retry state machine.
+  /// `_settleDeliveredQueuedTurns` can only retire a row it can PROVE was
+  /// delivered. Nothing could prove the opposite, so a submit that died inside a
+  /// WebSocket 1006 stayed `ambiguous` forever and kept blocking its queue
+  /// position: `_drainQueue` refuses that state, and
+  /// `_onQueuedTransportRestored` deliberately kept the block. `turn.status`
+  /// answers both ways — a known turn is adopted, an unknown one is proof of
+  /// absence and the row returns to the queue with the same `client_turn_id`,
+  /// which the server dedupes if it did land after all. Without
+  /// `turn_idempotency` this is a no-op and the row keeps its unknown semantics
+  /// for the user to resolve.
+  Future<void> _resolveAmbiguousQueuedTurns() async {
+    if (_disposed ||
+        _queuedAmbiguityInFlight ||
+        mutationsBlockedByOwnershipConflict) {
+      return;
+    }
+    final gateway = _desktopGateway;
+    final runtimeId = _desktopRuntimeSessionId;
+    if (gateway is! HermesDesktopIdempotentGateway ||
+        runtimeId == null ||
+        !gateway.isConnected) {
+      return;
+    }
+    final candidates = <QueuedPreparedTurn>[
+      for (final item in _preparedTurnQueue)
+        if (!identical(item.delivery, _activeTurnDelivery) &&
+            (item.turn.state == PreparedTurnState.ambiguous ||
+                item.turn.state == PreparedTurnState.submitting))
+          item,
+    ];
+    if (candidates.isEmpty) return;
+    _queuedAmbiguityInFlight = true;
+    final generation = _queueGeneration;
+    try {
+      for (final item in candidates) {
+        final clientTurnId = item.turn.clientTurnId;
+        final DesktopTurnStatus status;
+        try {
+          status = await (gateway as HermesDesktopIdempotentGateway)
+              .getTurnStatus(runtimeId, clientTurnId);
+        } on Object {
+          continue;
+        }
+        if (_disposed ||
+            generation != _queueGeneration ||
+            identical(item.delivery, _activeTurnDelivery) ||
+            !_preparedTurnQueue.any((queued) => identical(queued, item))) {
+          return;
+        }
+        if (!status.known || status.state == null) {
+          // Absent: the submit never reached the server. The retry reuses the
+          // same client_turn_id, so a row that did land cannot be duplicated.
+          await item.delivery.markRejectedBeforeAcceptance();
+          if (_blockedPreparedTurnId == clientTurnId) {
+            _blockedPreparedTurnId = null;
+          }
+        } else if (status.state == DesktopTurnState.terminal ||
+            status.state == DesktopTurnState.failed ||
+            status.state == DesktopTurnState.cancelled) {
+          _preparedTurnQueue.remove(item);
+          final owner = _preparedTurnOwners[clientTurnId];
+          if (owner != null && identical(owner.delivery, item.delivery)) {
+            _preparedTurnOwners.remove(clientTurnId);
+          }
+          if (_blockedPreparedTurnId == clientTurnId) {
+            _blockedPreparedTurnId = null;
+          }
+          _queuedDeliveryUnknownAt.remove(clientTurnId);
+          _clearQueuedRetryState(clientTurnId);
+        } else if (status.state == DesktopTurnState.accepted) {
+          await item.delivery.markAccepted();
+        } else {
+          await item.delivery.markRunning();
+        }
+        _emit(ActiveChatEvent.queueChanged);
+      }
+    } finally {
+      _queuedAmbiguityInFlight = false;
+      if (!_disposed &&
+          generation == _queueGeneration &&
+          !_queueDrainSuspended &&
+          !isStreaming) {
+        Timer.run(_drainQueue);
+      }
+    }
   }
 
   /// Los mensajes pendientes son independientes de que el turno anterior haya
