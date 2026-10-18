@@ -69,6 +69,16 @@ android {
            applicationIdSuffix = ".qa"
            versionNameSuffix = "-qa"
        }
+       // Fork lane: side-by-side owner build signed with the fork's own key.
+       // The isolated applicationId means installing it can never overwrite a
+       // Play or direct-download install, and its data never mixes with it.
+       // Product behavior stays identical: the Dart layer reads the flavor from
+       // --dart-define=HERMES_FLAVOR (defaults to full), not from this name.
+       create("fork") {
+           dimension = "distribution"
+           applicationIdSuffix = ".fork"
+           versionNameSuffix = "-fork"
+       }
    }
 
    buildTypes {
