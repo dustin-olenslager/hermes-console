@@ -1375,6 +1375,8 @@ class _ControlledApiClient extends ApiClient {
     String? profile,
     int limit = 120,
     int offset = 0,
+    bool includeReasoning = true,
+    int? maxContentChars,
   }) async => SessionMessagesPage(
     messages: await getMessages(sessionId, profile: profile),
     pagination: null,
@@ -1516,6 +1518,8 @@ class _PartialTailApi extends ApiClient {
     String? profile,
     int limit = 120,
     int offset = 0,
+    bool includeReasoning = true,
+    int? maxContentChars,
   }) async {
     requestedOffsets.add(offset);
     return SessionMessagesPage(
