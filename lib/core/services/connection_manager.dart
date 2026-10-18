@@ -1163,6 +1163,115 @@ class SessionMessagesPage {
   }
 }
 
+/// One cursor page of `/api/sessions/{id}/messages?after_row_id=`.
+///
+/// [supported] is the compatibility switch: it is true only when the answer
+/// itself proves the server understood the cursor (it echoed `after_row_id`, or
+/// every returned row is strictly newer than the requested one). A legacy
+/// server answers with the oldest page from zero and this class reports the
+/// answer as unsupported instead of applying it as a delta.
+final class SessionMessagesDelta {
+  const SessionMessagesDelta({
+    required this.messages,
+    required this.afterRowId,
+    required this.nextAfterRowId,
+    required this.tipRowId,
+    required this.supported,
+    required this.hasMore,
+    required this.messagesFullyParsed,
+  });
+
+  /// Chronological: oldest first.
+  final List<Map<String, dynamic>> messages;
+  final int afterRowId;
+
+  /// Row the next request continues from. Equals [afterRowId] on an empty page
+  /// so a caller that pages forward cannot loop on a stale coordinate.
+  final int? nextAfterRowId;
+
+  /// Newest row id the server held when it answered, when the server says so.
+  /// It is the upper bound of the sweep: a page that ends below it is not the
+  /// end of the catch-up even if [hasMore] is missing.
+  final int? tipRowId;
+
+  final bool supported;
+  final bool hasMore;
+  final bool messagesFullyParsed;
+
+  bool get isEmpty => messages.isEmpty;
+
+  /// Durable row identity of one transcript row, or null when the row carries
+  /// none. `row_id` is the durable coordinate; `id` is accepted as the older
+  /// spelling and ignored when it is not an integer (some payloads use it for
+  /// an opaque message id).
+  static int? rowIdOf(Object? row) {
+    if (row is! Map) return null;
+    for (final key in const ['row_id', 'id']) {
+      final value = row[key];
+      if (value is int) {
+        if (value > 0) return value;
+        continue;
+      }
+      if (value is String) {
+        final parsed = int.tryParse(value);
+        if (parsed != null && parsed > 0) return parsed;
+      }
+    }
+    return null;
+  }
+
+  factory SessionMessagesDelta.fromRaw({
+    required Object? rawMessages,
+    required Object? pagination,
+    required int requestedAfterRowId,
+    required int requestedLimit,
+  }) {
+    if (rawMessages is! List) {
+      throw const FormatException('Invalid session transcript delta');
+    }
+    final messages = <Map<String, dynamic>>[];
+    var fullyParsed = true;
+    for (final rawMessage in rawMessages) {
+      if (rawMessage is! Map) {
+        fullyParsed = false;
+        continue;
+      }
+      try {
+        messages.add(Map<String, dynamic>.from(rawMessage));
+      } on Object {
+        fullyParsed = false;
+      }
+    }
+    int? pageInt(String name) {
+      if (pagination is! Map) return null;
+      final value = pagination[name];
+      if (value is int) return value;
+      if (value is String) return int.tryParse(value);
+      return null;
+    }
+
+    final echoedAfter = pageInt('after_row_id');
+    final firstRowId = messages.isEmpty ? null : rowIdOf(messages.first);
+    final lastRowId = messages.isEmpty ? null : rowIdOf(messages.last);
+    final supported =
+        echoedAfter == requestedAfterRowId ||
+        (firstRowId != null && firstRowId > requestedAfterRowId);
+    final flag = pagination is Map ? pagination['has_more'] : null;
+    final hasMore = flag is bool
+        ? flag
+        : messages.length >= requestedLimit;
+    return SessionMessagesDelta(
+      messages: List.unmodifiable(messages),
+      afterRowId: requestedAfterRowId,
+      nextAfterRowId: lastRowId ?? requestedAfterRowId,
+      tipRowId: pageInt('tip_row_id'),
+      supported: supported,
+      hasMore: hasMore,
+      messagesFullyParsed: fullyParsed,
+    );
+  }
+}
+
 List<Map<String, dynamic>> _strictTranscriptMessages(Object? rawMessages) {
   if (rawMessages is! List) {
     throw const FormatException('Invalid session transcript');
@@ -1479,12 +1588,74 @@ class ApiClient {
     String? profile,
     int limit = 120,
     int offset = 0,
+    bool includeReasoning = true,
+    int? maxContentChars,
   }) => _readMessagesPage(
     sessionId,
     profile: profile,
     limit: limit,
     offset: offset,
+    includeReasoning: includeReasoning,
+    maxContentChars: maxContentChars,
   );
+
+  /// Rows newer than [afterRowId], oldest first.
+  ///
+  /// This is the delta contract the app needs and an offset cannot express:
+  /// `offset` on `order=latest` is measured backwards from the newest row, so a
+  /// message that lands mid-sweep shifts every window and either repeats or
+  /// skips rows — the reason the transcript reader already has to re-anchor by
+  /// row id after compaction. `row_id` is durable and monotonic, so
+  /// `after_row_id` is exclusive, stable under concurrent writes, and the same
+  /// call works for "a handful of new rows" and for a long catch-up.
+  ///
+  /// Support is decided by the answer, never assumed: a server that does not
+  /// know the parameter ignores it and replies with the oldest page from zero.
+  /// [SessionMessagesDelta.supported] is false then and the caller must fall
+  /// back to [getMessagesPage].
+  Future<SessionMessagesDelta> getMessagesAfter(
+    String sessionId, {
+    String? profile,
+    required int afterRowId,
+    int limit = 120,
+    bool includeReasoning = false,
+    int? maxContentChars,
+  }) async {
+    if (afterRowId < 0) {
+      throw const CoreReadException(CoreReadErrorKind.malformed);
+    }
+    final owner = validateCronProfile(profile);
+    final boundedLimit = limit.clamp(1, 500);
+    final uri = Uri.parse(
+      '$baseUrl/${profileEndpoint('api/sessions/${Uri.encodeComponent(sessionId)}/messages', profile: owner)}'
+      '?limit=$boundedLimit&order=oldest&after_row_id=$afterRowId'
+      '&include_compacted=true'
+      '&include_reasoning=${includeReasoning ? 'true' : 'false'}'
+      '${maxContentChars == null ? '' : '&max_content_chars=$maxContentChars'}',
+    );
+    final res = await _http.get(uri, headers: _headers).timeout(_requestTimeout);
+    if (res.statusCode != 200) {
+      throw CoreReadException(switch (res.statusCode) {
+        400 => CoreReadErrorKind.malformed,
+        401 => CoreReadErrorKind.auth,
+        403 => CoreReadErrorKind.forbidden,
+        404 when owner != null => CoreReadErrorKind.profileUnavailable,
+        404 => CoreReadErrorKind.notFound,
+        503 => CoreReadErrorKind.temporarilyUnavailable,
+        _ => CoreReadErrorKind.temporarilyUnavailable,
+      }, statusCode: res.statusCode);
+    }
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final rawMessages = data.containsKey('messages')
+        ? data['messages']
+        : data['data'];
+    return SessionMessagesDelta.fromRaw(
+      rawMessages: rawMessages,
+      pagination: data['pagination'],
+      requestedAfterRowId: afterRowId,
+      requestedLimit: boundedLimit,
+    );
+  }
 
   Future<SessionMessagesPage> _readMessagesPage(
     String sessionId, {
@@ -1492,16 +1663,23 @@ class ApiClient {
     required int limit,
     required int offset,
     int? maxBodyBytes,
+    bool includeReasoning = true,
+    int? maxContentChars,
   }) async {
     if (offset < 0) {
       throw const CoreReadException(CoreReadErrorKind.malformed);
     }
     final owner = validateCronProfile(profile);
     final boundedLimit = limit.clamp(1, 500);
+    final projectionQuery = <String>[
+      if (!includeReasoning) 'include_reasoning=false',
+      if (maxContentChars != null) 'max_content_chars=$maxContentChars',
+    ].join('&');
     final uri = Uri.parse(
       '$baseUrl/${profileEndpoint('api/sessions/${Uri.encodeComponent(sessionId)}/messages', profile: owner)}'
       '?limit=$boundedLimit&order=latest&offset=$offset'
-      '&include_compacted=true',
+      '&include_compacted=true'
+      '${projectionQuery.isEmpty ? '' : '&$projectionQuery'}',
     );
     final res = maxBodyBytes == null
         ? await _http.get(uri, headers: _headers).timeout(_requestTimeout)
