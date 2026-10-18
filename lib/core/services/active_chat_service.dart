@@ -10552,6 +10552,40 @@ class ActiveChat {
     return [for (final key in ordered) rows[key]!];
   }
 
+  /// True only when the persisted cursor proves the local projection already
+  /// covers everything the server has for this session.
+  ///
+  /// Fails closed on every uncertainty: no cursor, no local rows, a cursor that
+  /// does not line up with the newest row this device holds, a server that does
+  /// not understand `after_row_id`, or any error. A false negative costs the
+  /// ordinary page read; a false positive would hide new messages, so it is
+  /// never guessed.
+  Future<bool> _deltaProvesNothingNew(String profile) async {
+    if (_disposed || _messages.isEmpty || isStreaming) return false;
+    final localNewest = SessionMessagesDelta.rowIdOf(_messages.first);
+    if (localNewest == null) return false;
+    final cursor = await TranscriptCursorStore.read(
+      connection.id,
+      serverSessionId,
+      profile: _bindSessionProfile(profile),
+    );
+    if (cursor == null || cursor.rowId < localNewest) return false;
+    try {
+      // `limit: 1` is deliberate: this is a probe, not a read. If anything is
+      // newer the caller takes its normal path and renders it.
+      final delta = await _api.getMessagesAfter(
+        serverSessionId,
+        profile: profile,
+        afterRowId: cursor.rowId,
+        limit: 1,
+        includeReasoning: false,
+      );
+      return delta.supported && delta.messages.isEmpty;
+    } on Object {
+      return false;
+    }
+  }
+
   Future<void> loadMessages({
     int? expectedMessageCount,
     String profile = '',
@@ -11506,6 +11540,18 @@ class ActiveChat {
           StateError('Chat load failed');
     }
 
+    // Delta fast path: when this device already published a projection that
+    // covers the last durable row and the server confirms nothing is newer, the
+    // window we hold IS the answer. That is the difference between a resume
+    // re-reading a 1.7 MB window (plus the initial backfill walk behind it) and
+    // one small answer that says nothing changed. Anything uncertain falls
+    // through to the ordinary read below, unchanged.
+    if (await _deltaProvesNothingNew(profile)) {
+      if (!loadStillAuthorized()) return;
+      messagesLoaded = true;
+      onMessagesPublished?.call();
+      return;
+    }
     final context = _captureSessionMessagesPageRead(
       consumer: _SessionMessagesPageConsumer.directLoad,
       loadEpoch: loadEpoch,
