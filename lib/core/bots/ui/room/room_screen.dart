@@ -340,6 +340,15 @@ class RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
   final List<_OutgoingMessage> _outbox = [];
   int _outboxVersion = 0;
   bool _draining = false;
+
+  /// Bounded auto-retry for a send that failed on the wire. Before this, one
+  /// failure parked every message behind it until the user tapped retry, even
+  /// when the socket came back a second later — the room half of "the message
+  /// could not be sent".
+  static const int _maxOutboxRetryAttempts = 3;
+  static const Duration _outboxRetryBaseDelay = Duration(milliseconds: 800);
+  final Map<String, int> _outboxRetryAttempts = <String, int>{};
+  Timer? _outboxRetryTimer;
   Timer? _draftTimer;
   bool _draftDirty = false;
   bool _restoringDraft = false;
@@ -1447,11 +1456,41 @@ class RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
 
   void _retrySend(_OutgoingMessage message) {
     if (!message.failed || !_outbox.contains(message)) return;
+    _outboxRetryAttempts.remove(message.attempt.clientEventId);
     setState(() {
       message.failed = false;
       _outboxVersion++;
     });
     unawaited(_drain());
+  }
+
+  /// Retries a failed send with bounded exponential backoff (800 ms, 1.6 s,
+  /// 3.2 s) so a drop that heals by itself needs no user action.
+  ///
+  /// The attempt keeps its `durableEventId`, which is the server-side
+  /// idempotency key, and `_retirePublishedOutbox` retires the local bubble when
+  /// the event turns out to be in the log — so retrying after an ambiguous
+  /// close cannot post the message twice. The budget is per message: once it is
+  /// spent the bubble stays failed and waits for a manual retry rather than
+  /// retrying forever.
+  void _scheduleOutboxRetry(_OutgoingMessage message) {
+    final id = message.attempt.clientEventId;
+    final attempts = (_outboxRetryAttempts[id] ?? 0) + 1;
+    _outboxRetryAttempts[id] = attempts;
+    if (attempts > _maxOutboxRetryAttempts) return;
+    _outboxRetryTimer?.cancel();
+    _outboxRetryTimer = Timer(_outboxRetryBaseDelay * (1 << (attempts - 1)), () {
+      _outboxRetryTimer = null;
+      if (!_outbox.contains(message)) return;
+      // The queue is ordered: only the oldest failure may be retried, or a
+      // later message would overtake the one that did not go out.
+      final head = _outbox.where((m) => m.failed).firstOrNull;
+      if (!identical(head, message)) return;
+      message.failed = false;
+      _outboxVersion++;
+      if (mounted) setState(() {});
+      unawaited(_drain());
+    });
   }
 
   /// Delivers queued messages one at a time, oldest first. Keeps running
@@ -1487,6 +1526,7 @@ class RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
                 Future<void>.value(),
           );
           _outbox.remove(message);
+          _outboxRetryAttempts.remove(id);
           _outboxVersion++;
           if (!mounted) continue;
           _apply(result);
@@ -1499,6 +1539,9 @@ class RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
           }
           _outboxVersion++;
           if (mounted) setState(() {});
+          // Parked only until the socket heals: the retry keeps the same
+          // durable event id, so it can never post twice.
+          _scheduleOutboxRetry(message);
         }
       }
     } finally {
