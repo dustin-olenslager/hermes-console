@@ -26283,7 +26283,7 @@ class ActiveChat {
     final runtimeId = _desktopRuntimeSessionId;
     if (gateway == null || runtimeId == null) return;
     if (gateway is! HermesDesktopIdempotentGateway) return;
-    if (!(gateway as HermesDesktopGateway).isConnected) return;
+    if (!gateway.isConnected) return;
     final candidates = <QueuedPreparedTurn>[
       for (final item in _preparedTurnQueue)
         if (!identical(item.delivery, _activeTurnDelivery) &&
