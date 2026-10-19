@@ -549,6 +549,11 @@ void main() {
     expect(_keyPrefix('room-pending-'), findsNothing);
     expect(drafts.calls.last, 'clear:$id');
     expect(_composerText(tester), isEmpty);
+
+    // El reintento automático del outbox puede estar en vuelo cuando el árbol
+    // se destruye; se le deja asentarse para que no quede un temporizador vivo.
+    await tester.pump(const Duration(seconds: 2));
+    await tester.pumpAndSettle();
   });
 
   testWidgets('reopening never restores the draft of a message already in '
