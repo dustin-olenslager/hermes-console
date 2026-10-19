@@ -349,6 +349,7 @@ class RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
   static const Duration _outboxRetryBaseDelay = Duration(milliseconds: 800);
   final Map<String, int> _outboxRetryAttempts = <String, int>{};
   Timer? _outboxRetryTimer;
+  bool _disposed = false;
   Timer? _draftTimer;
   bool _draftDirty = false;
   bool _restoringDraft = false;
@@ -983,8 +984,9 @@ class RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
     _focus.dispose();
     _transcriptFocus.dispose();
     _highlightTimer?.cancel();
-    // A parked retry must not outlive the screen: the widget test binding (and
-    // a real device) treats a timer firing into a disposed tree as a defect.
+    // Un reintento aparcado no puede sobrevivir a la pantalla: ni el binding de
+    // test ni un dispositivo toleran un timer que dispara sobre un árbol muerto.
+    _disposed = true;
     _outboxRetryTimer?.cancel();
     _outboxRetryTimer = null;
     _transcriptScroll.dispose();
@@ -1478,6 +1480,10 @@ class RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
   /// spent the bubble stays failed and waits for a manual retry rather than
   /// retrying forever.
   void _scheduleOutboxRetry(_OutgoingMessage message) {
+    // El drenaje sigue vivo después de cerrar la pantalla, así que una
+    // excepción puede llegar aquí con el State ya destruido; un timer armado
+    // entonces dispararía sobre un árbol muerto.
+    if (_disposed) return;
     final id = message.attempt.clientEventId;
     final attempts = (_outboxRetryAttempts[id] ?? 0) + 1;
     _outboxRetryAttempts[id] = attempts;
