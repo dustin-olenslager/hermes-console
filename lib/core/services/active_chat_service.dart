@@ -10584,14 +10584,18 @@ class ActiveChat {
     return [for (final key in ordered) rows[key]!];
   }
 
-  /// Prueba de ausencia durable para un turno que el registro del gateway no
-  /// contiene.
+  /// Evidencia durable de aterrizaje para un turno que el registro del gateway
+  /// no contiene.
   ///
   /// La ruta de chat NO deduplica por `client_turn_id`: reenviar un turno que
   /// sí llegó lo ejecutaría dos veces. La única autoridad es el transcript
   /// durable, y la lectura es la ventana acotada (delta del cursor + cola de
   /// 120 filas sin razonamiento), no el historial completo.
-  Future<AmbiguousRetryEvidence> _proveTurnAbsence(
+  ///
+  /// [runSettled] solo tiene sentido con `delivered`: dice si la corrida ya
+  /// terminó (hay respuesta después del prompt), que es la diferencia entre
+  /// reenganchar a un run vivo y dejar que el transcript traiga la respuesta.
+  Future<({AmbiguousRetryEvidence evidence, bool runSettled})> _readTurnLanding(
     PreparedTurn turn, {
     String? sessionId,
   }) async {
@@ -10600,15 +10604,53 @@ class ActiveChat {
         _bindSessionProfile(turn.profile),
         sessionId: sessionId,
       );
-      return ambiguousTurnTranscriptEvidence(
+      final evidence = ambiguousTurnTranscriptEvidence(
         turn,
         chronological,
         requireRowAfterTurnCreation: true,
       );
+      return (
+        evidence: evidence,
+        runSettled: evidence == AmbiguousRetryEvidence.delivered
+            ? _runSettledAfterPrompt(turn, chronological)
+            : false,
+      );
     } on Object {
       // Fail closed: sin evidencia no se declara perdido nada.
-      return AmbiguousRetryEvidence.unknown;
+      return (evidence: AmbiguousRetryEvidence.unknown, runSettled: false);
     }
+  }
+
+  /// Una fila de assistant con texto después del prompt de este turno: la
+  /// corrida ya terminó y su respuesta está en el transcript.
+  bool _runSettledAfterPrompt(
+    PreparedTurn turn,
+    List<Map<String, dynamic>> chronological,
+  ) {
+    final candidates = <String>{
+      turn.text.trim(),
+      turn.fullText.trim(),
+      stripBotMentionNote(turn.desktopText ?? '').trim(),
+    }..remove('');
+    var promptIndex = -1;
+    for (var index = chronological.length - 1; index >= 0; index--) {
+      final message = chronological[index];
+      if (!isRealUserTurn(message)) continue;
+      final content = stripBotMentionNote(
+        (message['content'] ?? '').toString(),
+      ).trim();
+      if (!candidates.contains(content)) continue;
+      promptIndex = index;
+      break;
+    }
+    if (promptIndex < 0) return false;
+    for (var index = promptIndex + 1; index < chronological.length; index++) {
+      final message = chronological[index];
+      if (message['role'] != 'assistant') continue;
+      if ((message['content'] ?? '').toString().trim().isEmpty) continue;
+      return true;
+    }
+    return false;
   }
 
   Future<void> loadMessages({
@@ -20904,18 +20946,31 @@ class ActiveChat {
             // being persisted is never read as a lost one.
             absentObservations += 1;
             if (absentObservations < 2) continue;
-            final evidence = await _proveTurnAbsence(
+            final landing = await _readTurnLanding(
               delivery.current,
               sessionId: binding.storedSessionId,
             );
             if (!_canRecoverTurn(turnEpoch)) return;
-            if (evidence == AmbiguousRetryEvidence.delivered) {
+            if (landing.evidence == AmbiguousRetryEvidence.delivered) {
               // The user row is in the durable transcript: the turn landed and
-              // only its acknowledgement was lost. Adopt the accepted path so
-              // the queue moves on without a second send.
+              // only its acknowledgement was lost. Nothing is resent on either
+              // branch below.
               await delivery.markAccepted();
+              if (!_canRecoverTurn(turnEpoch)) return;
+              if (landing.runSettled) {
+                // The run finished while the acknowledgement was missing, so
+                // there is no live run to reattach to: the transcript already
+                // holds the answer. Converge and let the read publish it.
+                debugPrint('[active-chat] converged kind=durable_transcript');
+                await _completeRun();
+                unawaited(loadMessages(profile: _turnProfile));
+                return;
+              }
+              // The run is still generating with nothing streaming to this
+              // client. Reattach to that run through the accepted path, which
+              // commits the resume snapshot and never submits.
               recoveredState = DesktopTurnState.accepted;
-            } else if (evidence == AmbiguousRetryEvidence.notDelivered) {
+            } else if (landing.evidence == AmbiguousRetryEvidence.notDelivered) {
               await delivery.markRejectedBeforeAcceptance();
               if (!_canRecoverTurn(turnEpoch)) return;
               // The app is bilingual and this service has no BuildContext,
@@ -26345,7 +26400,7 @@ class ActiveChat {
           // chat route does not dedupe by `client_turn_id`. The durable
           // transcript decides, and only a proven absence goes back to the
           // queue for a resend.
-          final evidence = await _proveTurnAbsence(item.turn);
+          final evidence = (await _readTurnLanding(item.turn)).evidence;
           if (_disposed || generation != _queueGeneration) return;
           if (evidence == AmbiguousRetryEvidence.notDelivered) {
             await item.delivery.markRejectedBeforeAcceptance();
