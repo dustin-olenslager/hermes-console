@@ -1179,11 +1179,25 @@ final class SessionMessagesDelta {
     required this.supported,
     required this.hasMore,
     required this.messagesFullyParsed,
+    this.resolvedSessionId,
   });
 
   /// Chronological: oldest first.
   final List<Map<String, dynamic>> messages;
   final int afterRowId;
+
+  /// `session_id` the server actually answered from. A compression rotation
+  /// continues the transcript in a child session with a new id, so a cursor
+  /// stored for the parent must be dropped when this differs: row ids from two
+  /// sessions are not the same coordinate space.
+  final String? resolvedSessionId;
+
+  /// True when the answer came from a different session than the one asked
+  /// for, i.e. the cursor belongs to a transcript that has rotated away.
+  bool rotatedFrom(String requestedSessionId) {
+    final resolved = resolvedSessionId;
+    return resolved != null && resolved != requestedSessionId;
+  }
 
   /// Row the next request continues from. Equals [afterRowId] on an empty page
   /// so a caller that pages forward cannot loop on a stale coordinate.
@@ -1225,6 +1239,7 @@ final class SessionMessagesDelta {
     required Object? pagination,
     required int requestedAfterRowId,
     required int requestedLimit,
+    Object? resolvedSessionId,
   }) {
     if (rawMessages is! List) {
       throw const FormatException('Invalid session transcript delta');
@@ -1268,6 +1283,11 @@ final class SessionMessagesDelta {
       supported: supported,
       hasMore: hasMore,
       messagesFullyParsed: fullyParsed,
+      resolvedSessionId:
+          resolvedSessionId is String &&
+              resolvedSessionId.trim().isNotEmpty
+          ? resolvedSessionId.trim()
+          : null,
     );
   }
 }
@@ -1628,8 +1648,10 @@ class ApiClient {
     final boundedLimit = limit.clamp(1, 500);
     final uri = Uri.parse(
       '$baseUrl/${profileEndpoint('api/sessions/${Uri.encodeComponent(sessionId)}/messages', profile: owner)}'
+      // No `include_compacted` here: the route refuses a cursor read combined
+      // with it (400 invalid_pagination), and a compacted display generation
+      // cannot be merged under a row-id cursor anyway.
       '?limit=$boundedLimit&order=oldest&after_row_id=$afterRowId'
-      '&include_compacted=true'
       '&include_reasoning=${includeReasoning ? 'true' : 'false'}'
       '${maxContentChars == null ? '' : '&max_content_chars=$maxContentChars'}',
     );
@@ -1654,6 +1676,7 @@ class ApiClient {
       pagination: data['pagination'],
       requestedAfterRowId: afterRowId,
       requestedLimit: boundedLimit,
+      resolvedSessionId: data['session_id'],
     );
   }
 

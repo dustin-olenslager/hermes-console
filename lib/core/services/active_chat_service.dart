@@ -10468,7 +10468,11 @@ class ActiveChat {
         context.requestedOffset != 0 ||
         page.offset != 0 ||
         context.requestedStoredSessionId != serverSessionId ||
-        context.profile != _storedSessionProfile) {
+        context.profile != _storedSessionProfile ||
+        (page.resolvedTipId != null &&
+            page.resolvedTipId != context.requestedStoredSessionId)) {
+      // The last clause is the rotation guard: a page the server answered from
+      // a different session cannot seed a cursor for this one.
       return;
     }
     _confirmedPassiveTail = (
@@ -10539,7 +10543,21 @@ class ActiveChat {
           limit: 120,
           includeReasoning: false,
         );
-        if (delta.supported) absorb(delta.messages);
+        if (delta.rotatedFrom(storedSessionId)) {
+          // The transcript rotated (compression continued it in a child
+          // session). Row ids from two sessions share no coordinate space, so
+          // the stored cursor is dropped and this answer is ignored; the tail
+          // page below reads the live session.
+          unawaited(
+            TranscriptCursorStore.clear(
+              connection.id,
+              storedSessionId,
+              profile: profile,
+            ),
+          );
+        } else if (delta.supported) {
+          absorb(delta.messages);
+        }
       } on Object {
         // La ventana de cola de abajo sigue siendo suficiente.
       }
