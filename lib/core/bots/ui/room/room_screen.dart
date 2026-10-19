@@ -983,6 +983,10 @@ class RoomScreenState extends State<RoomScreen> with WidgetsBindingObserver {
     _focus.dispose();
     _transcriptFocus.dispose();
     _highlightTimer?.cancel();
+    // A parked retry must not outlive the screen: the widget test binding (and
+    // a real device) treats a timer firing into a disposed tree as a defect.
+    _outboxRetryTimer?.cancel();
+    _outboxRetryTimer = null;
     _transcriptScroll.dispose();
     _composerExtent.dispose();
     super.dispose();
