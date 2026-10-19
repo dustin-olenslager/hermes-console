@@ -10509,9 +10509,13 @@ class ActiveChat {
   /// desatasca una fila cuyo submit no cruzó el socket. La evidencia exacta que
   /// falta la aporta `turn.status` en `_resolveAmbiguousQueuedTurns`.
   Future<List<Map<String, dynamic>>> _readSettlementWindow(
-    String profile,
-  ) async {
-    final storedSessionId = serverSessionId;
+    String profile, {
+    String? sessionId,
+  }) async {
+    // `sessionId` overrides where the window is read from: the recovery path
+    // knows the durable id from its resume binding before this chat's
+    // `serverSessionId` has adopted it.
+    final storedSessionId = sessionId ?? serverSessionId;
     final rows = <int, Map<String, dynamic>>{};
     void absorb(List<Map<String, dynamic>> page) {
       for (var index = 0; index < page.length; index++) {
@@ -10560,6 +10564,33 @@ class ActiveChat {
     }
     final ordered = rows.keys.toList()..sort();
     return [for (final key in ordered) rows[key]!];
+  }
+
+  /// Prueba de ausencia durable para un turno que el registro del gateway no
+  /// contiene.
+  ///
+  /// La ruta de chat NO deduplica por `client_turn_id`: reenviar un turno que
+  /// sí llegó lo ejecutaría dos veces. La única autoridad es el transcript
+  /// durable, y la lectura es la ventana acotada (delta del cursor + cola de
+  /// 120 filas sin razonamiento), no el historial completo.
+  Future<AmbiguousRetryEvidence> _proveTurnAbsence(
+    PreparedTurn turn, {
+    String? sessionId,
+  }) async {
+    try {
+      final chronological = await _readSettlementWindow(
+        _bindSessionProfile(turn.profile),
+        sessionId: sessionId,
+      );
+      return ambiguousTurnTranscriptEvidence(
+        turn,
+        chronological,
+        requireRowAfterTurnCreation: true,
+      );
+    } on Object {
+      // Fail closed: sin evidencia no se declara perdido nada.
+      return AmbiguousRetryEvidence.unknown;
+    }
   }
 
   Future<void> loadMessages({
@@ -20840,38 +20871,55 @@ class ActiveChat {
           );
           if (status == null || !_canRecoverTurn(turnEpoch)) return;
           _publishDashboardAuthRequired(false);
-          final resultKind = status.known
-              ? status.state?.name ?? 'unknown'
-              : 'unknown';
-          debugPrint('[active-chat] result kind=$resultKind');
-          if (!status.known || status.state == null) {
+          var recoveredState = status.known ? status.state : null;
+          debugPrint(
+            '[active-chat] result kind=${recoveredState?.name ?? 'unknown'}',
+          );
+          if (recoveredState == null) {
             // The registry answered and does not contain this turn. Waiting
-            // cannot change that: nothing ever reached the server, so this is
-            // proof of absence, not ambiguity. Two consecutive answers are
-            // required so a submit still being persisted is never read as a
-            // lost one. Retrying here is the whole fix for "queued forever":
-            // the row goes back to `failedBeforeAcceptance` and the queue
-            // resubmits it with the same client_turn_id, which the server
-            // dedupes if it did land after all.
+            // cannot change that, but absence from the registry is NOT proof
+            // of absence on the server: the chat route does not dedupe by
+            // `client_turn_id`, so resubmitting a turn that did land runs it a
+            // second time. The durable transcript is the only authority, and
+            // the read is the bounded settlement window, not the full history.
+            // Two consecutive answers are still required so a submit that is
+            // being persisted is never read as a lost one.
             absentObservations += 1;
             if (absentObservations < 2) continue;
-            await delivery.markRejectedBeforeAcceptance();
-            if (!_canRecoverTurn(turnEpoch)) return;
-            // The app is bilingual and this service has no BuildContext, so
-            // the sentence follows the same inline EN/ES idiom as
-            // activeChatPromptFailureUiMessage above.
-            _failRun(
-              PlatformDispatcher.instance.locale.languageCode == 'es'
-                  ? 'Hermes no recibió este mensaje. No se envió y la cola lo '
-                        'está reintentando.'
-                  : 'Hermes never received this message. It was not sent, and '
-                        'the queue is retrying it.',
-              failureMetadata: const {'delivery': 'not_sent'},
+            final evidence = await _proveTurnAbsence(
+              delivery.current,
+              sessionId: binding.storedSessionId,
             );
-            return;
+            if (!_canRecoverTurn(turnEpoch)) return;
+            if (evidence == AmbiguousRetryEvidence.delivered) {
+              // The user row is in the durable transcript: the turn landed and
+              // only its acknowledgement was lost. Adopt the accepted path so
+              // the queue moves on without a second send.
+              await delivery.markAccepted();
+              recoveredState = DesktopTurnState.accepted;
+            } else if (evidence == AmbiguousRetryEvidence.notDelivered) {
+              await delivery.markRejectedBeforeAcceptance();
+              if (!_canRecoverTurn(turnEpoch)) return;
+              // The app is bilingual and this service has no BuildContext,
+              // so the sentence follows the same inline EN/ES idiom as
+              // activeChatPromptFailureUiMessage above.
+              _failRun(
+                PlatformDispatcher.instance.locale.languageCode == 'es'
+                    ? 'Hermes no recibió este mensaje. No se envió y la cola '
+                          'lo está reintentando.'
+                    : 'Hermes never received this message. It was not sent, '
+                          'and the queue is retrying it.',
+                failureMetadata: const {'delivery': 'not_sent'},
+              );
+              return;
+            } else {
+              // No se puede demostrar ausencia: esperar es la respuesta
+              // segura; reenviar sería ejecutar el turno por segunda vez.
+              continue;
+            }
           }
           absentObservations = 0;
-          switch (status.state!) {
+          switch (recoveredState) {
             case DesktopTurnState.accepted:
               if (!_commitDesktopRecoverySnapshot(gateway, binding)) continue;
               _desktopStoredSessionId = binding.storedSessionId;
@@ -26275,12 +26323,24 @@ class ActiveChat {
           return;
         }
         if (!status.known || status.state == null) {
-          // Absent: the submit never reached the server. The retry reuses the
-          // same client_turn_id, so a row that did land cannot be duplicated.
-          await item.delivery.markRejectedBeforeAcceptance();
-          if (_blockedPreparedTurnId == clientTurnId) {
-            _blockedPreparedTurnId = null;
+          // Absent from the registry is not proof of absence on the server: the
+          // chat route does not dedupe by `client_turn_id`. The durable
+          // transcript decides, and only a proven absence goes back to the
+          // queue for a resend.
+          final evidence = await _proveTurnAbsence(item.turn);
+          if (_disposed || generation != _queueGeneration) return;
+          if (evidence == AmbiguousRetryEvidence.notDelivered) {
+            await item.delivery.markRejectedBeforeAcceptance();
+            if (_blockedPreparedTurnId == clientTurnId) {
+              _blockedPreparedTurnId = null;
+            }
+          } else if (evidence == AmbiguousRetryEvidence.delivered) {
+            // Landed, acknowledgement lost: settle it as accepted instead of
+            // running it again.
+            await item.delivery.markAccepted();
           }
+          // `unknown`: no evidence either way. The row keeps its state and the
+          // next reconnect asks again; nothing is resent on a guess.
         } else if (status.state == DesktopTurnState.terminal ||
             status.state == DesktopTurnState.failed ||
             status.state == DesktopTurnState.cancelled) {
