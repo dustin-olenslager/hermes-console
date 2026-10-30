@@ -3648,7 +3648,7 @@
       "version": "2.20.0"
     },
     {
-      "bom-ref": "pkg:maven/io.flutter/arm64_v8a_release@1.0.0-5d531788691ec3404cac0cee66ead4007b177363",
+      "bom-ref": "pkg:maven/io.flutter/arm64_v8a_release@1.0.0-89c39edfdfae2949f6806e4a315c0c08522238b7",
       "group": "io.flutter",
       "licenses": [
         {
@@ -3670,12 +3670,12 @@
           "value": "curated-catalog"
         }
       ],
-      "purl": "pkg:maven/io.flutter/arm64_v8a_release@1.0.0-5d531788691ec3404cac0cee66ead4007b177363",
+      "purl": "pkg:maven/io.flutter/arm64_v8a_release@1.0.0-89c39edfdfae2949f6806e4a315c0c08522238b7",
       "type": "library",
-      "version": "1.0.0-5d531788691ec3404cac0cee66ead4007b177363"
+      "version": "1.0.0-89c39edfdfae2949f6806e4a315c0c08522238b7"
     },
     {
-      "bom-ref": "pkg:maven/io.flutter/armeabi_v7a_release@1.0.0-5d531788691ec3404cac0cee66ead4007b177363",
+      "bom-ref": "pkg:maven/io.flutter/armeabi_v7a_release@1.0.0-89c39edfdfae2949f6806e4a315c0c08522238b7",
       "group": "io.flutter",
       "licenses": [
         {
@@ -3697,12 +3697,12 @@
           "value": "curated-catalog"
         }
       ],
-      "purl": "pkg:maven/io.flutter/armeabi_v7a_release@1.0.0-5d531788691ec3404cac0cee66ead4007b177363",
+      "purl": "pkg:maven/io.flutter/armeabi_v7a_release@1.0.0-89c39edfdfae2949f6806e4a315c0c08522238b7",
       "type": "library",
-      "version": "1.0.0-5d531788691ec3404cac0cee66ead4007b177363"
+      "version": "1.0.0-89c39edfdfae2949f6806e4a315c0c08522238b7"
     },
     {
-      "bom-ref": "pkg:maven/io.flutter/flutter_embedding_release@1.0.0-5d531788691ec3404cac0cee66ead4007b177363",
+      "bom-ref": "pkg:maven/io.flutter/flutter_embedding_release@1.0.0-89c39edfdfae2949f6806e4a315c0c08522238b7",
       "group": "io.flutter",
       "licenses": [
         {
@@ -3724,12 +3724,12 @@
           "value": "curated-catalog"
         }
       ],
-      "purl": "pkg:maven/io.flutter/flutter_embedding_release@1.0.0-5d531788691ec3404cac0cee66ead4007b177363",
+      "purl": "pkg:maven/io.flutter/flutter_embedding_release@1.0.0-89c39edfdfae2949f6806e4a315c0c08522238b7",
       "type": "library",
-      "version": "1.0.0-5d531788691ec3404cac0cee66ead4007b177363"
+      "version": "1.0.0-89c39edfdfae2949f6806e4a315c0c08522238b7"
     },
     {
-      "bom-ref": "pkg:maven/io.flutter/x86_64_release@1.0.0-5d531788691ec3404cac0cee66ead4007b177363",
+      "bom-ref": "pkg:maven/io.flutter/x86_64_release@1.0.0-89c39edfdfae2949f6806e4a315c0c08522238b7",
       "group": "io.flutter",
       "licenses": [
         {
@@ -3751,9 +3751,9 @@
           "value": "curated-catalog"
         }
       ],
-      "purl": "pkg:maven/io.flutter/x86_64_release@1.0.0-5d531788691ec3404cac0cee66ead4007b177363",
+      "purl": "pkg:maven/io.flutter/x86_64_release@1.0.0-89c39edfdfae2949f6806e4a315c0c08522238b7",
       "type": "library",
-      "version": "1.0.0-5d531788691ec3404cac0cee66ead4007b177363"
+      "version": "1.0.0-89c39edfdfae2949f6806e4a315c0c08522238b7"
     },
     {
       "bom-ref": "pkg:maven/io.github.webrtc-sdk/android@150.7871.01",
